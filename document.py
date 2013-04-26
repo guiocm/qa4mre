@@ -1,9 +1,10 @@
 import xml.etree.ElementTree as ET
-import nltk, re, string, csv
+import nltk, re, string, csv, itertools
 from functools import reduce
 from unidecode import unidecode
 from collections import defaultdict, Counter
 from nltk.metrics.distance import masi_distance, jaccard_distance
+from nltk.corpus import wordnet
 
 class Document:
     def __init__(self, docXML):
@@ -63,9 +64,9 @@ def stopword_punct_remove(sentences):
     punct = set(['.', ',', ';', ':', '?', '!', '(', ')', '"', '*'])
     return [sent - sw - punct for sent in sentences]
 
-def lemmatize(sentence):
+def lemmatize(sentences):
     lem = nltk.stem.wordnet.WordNetLemmatizer()
-    return set(lem.lemmatize(word) for word in sentence)
+    return [set(lem.lemmatize(word) for word in sentence) for sentence in sentences]
     
 def stem(sentences):
     st = nltk.stem.PorterStemmer()
@@ -77,6 +78,23 @@ def join_adjacent(doc):
         new_doc.append(set.union(doc[idx], doc[idx+1]))
 
     return new_doc or doc
+
+def tag(sentences):
+    return [nltk.tag.pos_tag(sent) for sent in sentences]
+
+def nouns_verbs(sentences):
+    ret = []
+
+    for sent in sentences:
+        d = defaultdict(list)
+        for w, t in sent:
+            if t[0] == "N":
+                d["N"].append(w)
+            if t[0] == "V":
+                d["V"].append(w)
+        ret.append(d)
+
+    return ret
 
 #
 #   Baseline QA methods
@@ -106,6 +124,7 @@ def topk_conc_dist(test_case, topk, metric):
             sims = sorted([metric(sent, hyp) for sent in doc])
             avg_dists.append(topk - sum(sims[:topk]))
 
+        #print avg_dists
         choices.append(best(avg_dists))
 
     return choices
@@ -127,11 +146,65 @@ def term_pair_rel(doc):
 
     return rel
 
+def idk(test_case):
+    doc, questions = test_case
+    rel = term_pair_rel(doc)
+    choices = []
 
+    for q_str, answers in questions:
+        sims = []
+        for ans in answers:
+            tot = sum([sum(map(lambda x: rel[wd][x], ans)) for wd in q_str])
+            sims.append(float(tot)/(len(q_str)+len(ans)))
+        choices.append(best(sims))
+
+    return choices
+
+def get_synsets(words, tag):
+    ret = []
+    for word in words:
+        try:
+            ret.append(wordnet.synsets(word, tag)[0])
+        except:
+            print word
+    return ret
+
+def list_sim(l1, l2, sim):
+    if l1 and l2:
+        return sum(map(lambda x: sim(*x), itertools.product(l1,l2)))/(len(l1)+len(l2))
+    return 0
+
+def sim_measure(sent, q, ans, sim):
+    sent_ns = get_synsets(sent["N"], wordnet.NOUN)
+    sent_vs = get_synsets(sent["V"], wordnet.VERB)
+    q_ns = get_synsets(q["N"], wordnet.NOUN)
+    q_vs = get_synsets(q["V"], wordnet.VERB)
+    ans_ns = get_synsets(ans["N"], wordnet.NOUN)
+    ans_vs = get_synsets(ans["V"], wordnet.VERB)
+    q_sim = list_sim(sent_ns, q_ns, sim) + list_sim(sent_vs, q_vs, sim)
+    ans_sim = list_sim(sent_ns, ans_ns, sim) + list_sim(sent_vs, ans_vs, sim)
+    return (q_sim+ans_sim)/2
+
+
+def wn_rel(test_case, sim):
+    doc, questions = test_case
+    choices = []
+
+    for q_str, answers in questions:
+        sims = [max([sim_measure(sent, q_str, ans, sim) for sent in doc]) for ans in answers]
+
+        choices.append(best(sims))
+
+    return choices
 
 #
 #   Test Framework
 #
+def join_dd(a,b):
+    r = a.copy()
+    r.update(b)
+    return r
+
 def c_at_1(right, unansw, total):
     return (right + unansw*float(right)/total)/total
 
@@ -151,6 +224,8 @@ def test(document, preprocess, methods, counts):
         q_str, ans = pre_qs[i]
         q_str = reduce(set.union, q_str)
         ans = [reduce(set.union, a) for a in ans]
+        #q_str = reduce(join_dd, q_str)
+        #ans = [reduce(join_dd, a) for a in ans]
         pre_qs[i] = q_str, ans
 
     test_case = doc, pre_qs
@@ -184,28 +259,38 @@ def test(document, preprocess, methods, counts):
 if __name__ == '__main__':
     d = Document("/home/gm/thesis/test/QA4MRE-2012-EN_GS.xml")
 
-    print d.get_test(3,3)
+    #print d.get_test(3,3)
 
-    o = "test_masi_jac"
+    o = "test_lem"
+    
+    #'''
     pre = [\
         fix_punct,\
         split_sentences,\
         bag_of_words,\
         stopword_punct_remove,\
-        stem] #,\
+        stem]#,\
         #join_adjacent]
-
+    
     met = {\
         topk_conc_dist:[\
             [1,masi_distance],\
             [2,masi_distance],\
             [3,masi_distance],\
-            [5,masi_distance],\
-            [1,jaccard_distance],\
-            [2,jaccard_distance],\
-            [3,jaccard_distance],\
-            [5,jaccard_distance]]}
+            [5,masi_distance]]}
+    #'''
+    '''
+    pre = [\
+        fix_punct,\
+        split_sentences,\
+        tag,\
+        nouns_verbs]
 
+    met = {wn_rel: [[wordnet.path_similarity]]}
+    '''
+    #t = d.get_test(0,2)
+    #print test(t,pre,met,defaultdict(dict))
+    
     with open(o + ".csv", "wb") as ofile:
         output = csv.writer(ofile)
         counts = defaultdict(dict)
@@ -217,7 +302,7 @@ if __name__ == '__main__':
                     output.writerow([topic, document] + r)
                 output.writerow([])
 
-
+    
     with open(o + "_cat1.csv", "wb") as ofile:
         output = csv.writer(ofile)
         totals = defaultdict(Counter)
@@ -243,4 +328,4 @@ if __name__ == '__main__':
             total = totals[method]['t']
             output.writerow(["all"] + list(method) + [right, unansw, total, c_at_1(right, unansw, total)])
 
-
+    
