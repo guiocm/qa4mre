@@ -82,6 +82,19 @@ def join_adjacent(doc):
 def tag(sentences):
     return [nltk.tag.pos_tag(sent) for sent in sentences]
 
+def ner(sentences):
+    return [nltk.chunk.ne_chunk(sent, binary=True) for sent in sentences]
+
+def NEindex(sentences):
+    idx = defaultdict(set)
+    for i in range(len(sentences)):
+        for el in sentences[i]:
+            if "node" in dir(el) and el.node == "NE":
+                nstr = reduce(lambda x,y: x+" "+y, [v[0] for v in el])
+                idx[nstr].add(i)
+    return idx
+
+
 def nouns_verbs(sentences):
     ret = []
 
@@ -113,18 +126,20 @@ def best(lst):
     return 0, 0
 
 
+def topk_conc_one(doc, q_str, answers, k, metric):
+    dists = []
+    for ans in answers:
+        hyp = set.union(q_str, ans)
+        sims = sorted([metric(sent, hyp) for sent in doc])
+        dists.append(k - sum(sims[:k]))
+    return dists
+
 def topk_conc_dist(test_case, topk, metric):
     doc, questions = test_case
     choices = []
 
     for q_str, answers in questions:
-        avg_dists = []
-        for ans in answers:
-            hyp = set.union(q_str, ans)
-            sims = sorted([metric(sent, hyp) for sent in doc])
-            avg_dists.append(topk - sum(sims[:topk]))
-
-        #print avg_dists
+        avg_dists = topk_conc_one(doc, q_str, answers, topk, metric)
         choices.append(best(avg_dists))
 
     return choices
@@ -166,7 +181,8 @@ def get_synsets(words, tag):
         try:
             ret.append(wordnet.synsets(word, tag)[0])
         except:
-            print word
+            #print word, tag
+            continue
     return ret
 
 def list_sim(l1, l2, sim):
@@ -198,6 +214,17 @@ def wn_rel(test_case, sim):
     return choices
 
 #
+#   "Smart" method
+#
+def ensemble(document):
+    doc, qs = document
+    pre_doc = split_sentences(fix_punct(doc))
+
+    for q_str, answers in qs:
+        continue
+
+
+#
 #   Test Framework
 #
 def join_dd(a,b):
@@ -209,9 +236,15 @@ def c_at_1(right, unansw, total):
     return (right + unansw*float(right)/total)/total
 
 def form(lst):
-    return [el.__name__ if '__name__' in dir(el) else str(el) for el in lst]
+    ret = []
+    for el in lst:
+        try:
+            ret.append(el.__name__) 
+        except:
+            ret.append(str(el))
+    return ret
 
-def test(document, preprocess, methods, counts):
+def test(document, preprocess, methods, counts, uncert):
     doc, questions = document
     pre_qs = [(q_str, ans) for q_str, ans, cor in questions]
     for fn in preprocess:
@@ -222,10 +255,10 @@ def test(document, preprocess, methods, counts):
 
     for i in range(len(pre_qs)):
         q_str, ans = pre_qs[i]
-        q_str = reduce(set.union, q_str)
-        ans = [reduce(set.union, a) for a in ans]
-        #q_str = reduce(join_dd, q_str)
-        #ans = [reduce(join_dd, a) for a in ans]
+        #q_str = reduce(set.union, q_str)
+        #ans = [reduce(set.union, a) for a in ans]
+        q_str = reduce(join_dd, q_str)
+        ans = [reduce(join_dd, a) for a in ans]
         pre_qs[i] = q_str, ans
 
     test_case = doc, pre_qs
@@ -241,12 +274,11 @@ def test(document, preprocess, methods, counts):
                 
                 res.append(conf * (1 if choice == corr else -1))
 
-            right = len([x for x in res if x > 0.03])
-            unansw = len([x for x in res if x >= -0.03 and x <= 0.03])
+            right = len([x for x in res if x > uncert])
+            unansw = len([x for x in res if x >= -uncert and x <= uncert])
             total = len(res)
             res.append(c_at_1(right, unansw, total))
-
-            idt = form([method] + params)
+            idt = form([method] + params + [uncert])
             ret.append(idt + res)
 
             counts[tuple(idt)] = {'r': right, 'u': unansw, 't': total}
@@ -259,26 +291,35 @@ def test(document, preprocess, methods, counts):
 if __name__ == '__main__':
     d = Document("/home/gm/thesis/test/QA4MRE-2012-EN_GS.xml")
 
-    #print d.get_test(3,3)
+    t = d.get_test(0,0)
 
-    o = "test_lem"
+    o = "test_wn"
     
-    #'''
+    '''
     pre = [\
         fix_punct,\
         split_sentences,\
         bag_of_words,\
         stopword_punct_remove,\
-        stem]#,\
-        #join_adjacent]
+        stem,\
+        join_adjacent]
     
     met = {\
         topk_conc_dist:[\
-            [1,masi_distance],\
-            [2,masi_distance],\
-            [3,masi_distance],\
-            [5,masi_distance]]}
-    #'''
+            #[1,masi_distance],\
+            [2,masi_distance]]} #,\
+            #[3,masi_distance],\
+            #[5,masi_distance]]}
+    
+    doc = t[0]
+
+    doc = ner(tag(split_sentences(fix_punct(doc))))
+    for sent in doc:
+        print sent
+
+    for k,v in NEindex(doc).items():
+        print k,v
+
     '''
     pre = [\
         fix_punct,\
@@ -287,7 +328,7 @@ if __name__ == '__main__':
         nouns_verbs]
 
     met = {wn_rel: [[wordnet.path_similarity]]}
-    '''
+    
     #t = d.get_test(0,2)
     #print test(t,pre,met,defaultdict(dict))
     
@@ -297,7 +338,7 @@ if __name__ == '__main__':
         for topic in range(4):
             for document in range(4):
                 t = d.get_test(topic, document)
-                res = test(t, pre, met, counts[topic,document])
+                res = test(t, pre, met, counts[topic,document], 0.03)
                 for r in res:
                     output.writerow([topic, document] + r)
                 output.writerow([])
@@ -328,4 +369,6 @@ if __name__ == '__main__':
             total = totals[method]['t']
             output.writerow(["all"] + list(method) + [right, unansw, total, c_at_1(right, unansw, total)])
 
-    
+    #'''
+
+
