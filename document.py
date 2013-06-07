@@ -1,45 +1,13 @@
 import xml.etree.ElementTree as ET
-import nltk, re, string, csv, itertools
+import nltk, re, string, csv, itertools, random
 from functools import reduce
 from unidecode import unidecode
 from collections import defaultdict, Counter
 from nltk.metrics.distance import masi_distance, jaccard_distance
 from nltk.corpus import wordnet
-
-class Document:
-    def __init__(self, docXML):
-        self.doc = ET.parse(docXML).getroot()
-
-    def get_test(self, topic_id, test_id):
-        '''
-        Returns document and questions for one of the reading tests,
-        specified by the parameters topic_id and test_id,
-        in the format:
-        (document, questions) 
-        document - string containing the text 
-        questions - list of tuples (q_str, answers, correct)
-            q_str - string containing the question text
-            answers - list of strings containing the 5 possible answers
-            correct - the index of the correct answer in the previous list 
-        '''
-        test = self.doc[topic_id][test_id]
-
-        doc = test[0].text
-
-        questions = []
-
-        for q in test[1:]:
-            q_str = q.find('q_str').text
-            answers = []
-            for ans in q.findall('answer'):
-                answers.append(ans.text)
-                if 'correct' in ans.attrib:
-                    correct = int(ans.get('a_id')) - 1
-
-            questions.append((q_str, answers, correct))
-
-        return doc, questions
-
+from testparser import Document
+from stanford import StanfordNLP
+from output import Output
 
 #
 #   Preprocessing functions
@@ -117,13 +85,31 @@ def unique(lst, val):
         return True
     return False
 
-def best(lst):
+def best(lst, tie, threshold):
     ch = lst.index(max(lst))
     if unique(lst, lst[ch]):
         m = lst.pop(ch)
         conf = (m - max(lst))/m
         return ch, conf
-    return 0, 0
+    return handle_tie(lst, tie, threshold)
+
+def handle_tie(lst, tie, threshold):
+    print max(lst)
+    if tie == 1:
+	return 4, 0.25
+    elif tie == 2:
+	return -1, 0
+    elif tie == 3:
+	if max(lst) <= threshold:
+	    return 4, 0.25
+	else:
+	    return -1, 0
+    else:
+	if max(lst) <= threshold:
+	    return 4, 0.25
+	else:
+	    opts = [i for i in range(len(lst)) if lst[i] == max(lst)]
+	    return random.choice(opts), 0.25
 
 
 def topk_conc_one(doc, q_str, answers, k, metric):
@@ -134,13 +120,13 @@ def topk_conc_one(doc, q_str, answers, k, metric):
         dists.append(k - sum(sims[:k]))
     return dists
 
-def topk_conc_dist(test_case, topk, metric):
+def topk_conc_dist(test_case, topk, metric, tie, threshold):
     doc, questions = test_case
     choices = []
 
     for q_str, answers in questions:
         avg_dists = topk_conc_one(doc, q_str, answers, topk, metric)
-        choices.append(best(avg_dists))
+        choices.append(best(avg_dists, tie, threshold))
 
     return choices
 
@@ -285,15 +271,94 @@ def test(document, preprocess, methods, counts, uncert):
 
     return ret
     
+def preprocess(string):
+    return  \
+	    lemmatize(\
+	    stopword_punct_remove(\
+	    bag_of_words(\
+	    split_sentences(\
+		string))))
 
+def testNewCode(document, counts):
+    doc, questions = document
+
+    st = StanfordNLP(doc)
+    sentences = st.preprocess_to_setsim()
+
+    sentences = join_adjacent(lemmatize(sentences))
+    
+    pre_qs = []
+    correct = []
+
+    for q_str, answers, cor in questions:
+	pre_qs.append((reduce(set.union, preprocess(q_str)), [reduce(set.union, preprocess(ans)) for ans in answers]))
+	correct.append(cor)
+
+
+    ret = []
+    for k in [1,2,3,5]:
+	results = topk_conc_dist((sentences, pre_qs), k, masi_distance, 1, 0)
+
+	res = []
+	for i in range(len(results)):
+	    choice, conf = results[i]
+	    corr = correct[i]
+	    res.append(conf * (1 if choice == corr else -1))
+
+	right = len([x for x in res if x > 0])
+	unansw = len([x for x in res if x == 0])
+	total = len(res)
+	res.append(c_at_1(right, unansw, total))
+
+	idt=["anaphora", k]
+
+	counts[tuple(idt)] = {'r': right, 'u': unansw, 't': total}
+	ret.append(res)
+
+    return ret
+
+
+#
+#   2013 stuff
+#
+def run_topk_coref_2013(document, tie, threshold):
+    doc, questions = document
+
+    st = StanfordNLP(doc)
+    sentences = st.preprocess_to_setsim()
+    sentences = stem(sentences)
+    
+    pre_qs = []
+
+    for q_str, answers, cor in questions:
+	pre_qs.append((reduce(set.union, preprocess(q_str)), [reduce(set.union, preprocess(ans)) for ans in answers][:-1]))
+
+    results = topk_conc_dist((sentences, pre_qs), 2, masi_distance, tie, threshold)
+
+    return results
+
+
+def run_topk_join_2013(document, tie, threshold):
+    doc, questions = document
+
+    sentences = join_adjacent(preprocess(doc))
+    pre_qs = []
+
+    for q_str, answers, cor in questions:
+	pre_qs.append((reduce(set.union, preprocess(q_str)), [reduce(set.union, preprocess(ans)) for ans in answers][:-1]))
+    
+    results = topk_conc_dist((sentences, pre_qs), 2, masi_distance, tie, threshold)
+
+    return results
+
+    
 
 
 if __name__ == '__main__':
-    d = Document("/home/gm/thesis/test/QA4MRE-2012-EN_GS.xml")
+    d = Document("/home/gm/KUL/thesis/tests2012.xml")
 
     t = d.get_test(0,0)
 
-    o = "test_wn"
     
     '''
     pre = [\
@@ -329,8 +394,14 @@ if __name__ == '__main__':
 
     met = {wn_rel: [[wordnet.path_similarity]]}
     
-    #t = d.get_test(0,2)
+    #t = d.get_test(0,0)
+    #print t
+
     #print test(t,pre,met,defaultdict(dict))
+    
+    o = "test_anaphora_lemmatize_join_ks"
+
+    #out = Output("kule", "13", "09", "en", "en")
     
     with open(o + ".csv", "wb") as ofile:
         output = csv.writer(ofile)
@@ -338,12 +409,19 @@ if __name__ == '__main__':
         for topic in range(4):
             for document in range(4):
                 t = d.get_test(topic, document)
-                res = test(t, pre, met, counts[topic,document], 0.03)
-                for r in res:
-                    output.writerow([topic, document] + r)
-                output.writerow([])
+                #res = test(t, pre, met, counts[topic,document], 0.03)
+		ret = testNewCode(t, counts[topic,document])
+		#res = run_topk_coref_2013(t, 4, 0.1)
+		for res in ret:
+		#res = run_topk_join_2013(t, 4, 0.1)
 
+		    output.writerow([topic, document] + res)
+                output.writerow([])
+		#out.add_test(topic, document, res)
+
+    #out.write()
     
+
     with open(o + "_cat1.csv", "wb") as ofile:
         output = csv.writer(ofile)
         totals = defaultdict(Counter)
@@ -369,6 +447,5 @@ if __name__ == '__main__':
             total = totals[method]['t']
             output.writerow(["all"] + list(method) + [right, unansw, total, c_at_1(right, unansw, total)])
 
-    #'''
 
 
